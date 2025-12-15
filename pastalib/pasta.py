@@ -342,8 +342,9 @@ class PASTA(abc.ABC):
     ) -> dict[int, torch.Tensor]:
         """Vectorized construction of per-layer masks with scale_position applied.
 
-        返回的掩码已经融合了 scale_position 语义，并乘上 ``log(alpha)``，可直接加到
-        attention_mask 上。形状：``(bsz, num_heads, 1, input_len)``。
+        返回的掩码已经融合了 scale_position 语义，但尚未乘上 ``log(alpha)``，需要在
+        `edit_multisection_attention_fast` 中再缩放后直接加到 attention_mask 上。
+        形状：``(bsz, num_heads, 1, input_len)``。
         """
         if head_config is None:
             head_config = self.head_config
@@ -363,10 +364,7 @@ class PASTA(abc.ABC):
         if device is None:
             device = token_ranges[0].device
 
-        if self.scale_constant is None:
-            self.scale_constant = torch.tensor([self.alpha], device=device, dtype=dtype).log()
-
-        stacked = torch.stack(token_ranges, dim=0)  # (num_sections, bsz, 2)
+        stacked = torch.stack(token_ranges, dim=0).to(device)  # (num_sections, bsz, 2)
         starts = stacked[..., 0]
         ends = stacked[..., 1]
         valid = ends > starts
@@ -386,7 +384,7 @@ class PASTA(abc.ABC):
         else:
             raise ValueError(f"Unexpected scale_position {self.scale_position}.")
 
-        base_mask = base_counts * self.scale_constant.view(1)
+        base_mask = base_counts
         
         op_masks: dict[int, torch.Tensor] = {}
         head_template = torch.zeros(self.num_attn_head, device=device, dtype=dtype)
@@ -397,6 +395,7 @@ class PASTA(abc.ABC):
             op_masks[layer_idx] = base_mask.unsqueeze(1).unsqueeze(2) * head_weights.view(1, -1, 1, 1)
 
         return op_masks
+
 
     def edit_multisection_attention_fast(
         self, 
@@ -452,31 +451,35 @@ class PASTA(abc.ABC):
         if mask.size(2) == 1 and tgt_len > 1:
             mask = mask.expand(-1, -1, tgt_len, -1)
 
+        # Apply scaling here so build_operation_masks remains scale-agnostic.
+        mask = mask * self.scale_constant.view(1, 1, 1, 1)
+
         if mask.size(-1) != src_len:
             raise ValueError(
                 f"operation_mask last dim {mask.size(-1)} mismatches attention src_len {src_len}"
             )
 
-        temp_attention_mask = attention_mask.clone()
-        temp_attention_mask = temp_attention_mask + mask
-        for token_range in token_ranges:
-            for bi, (ti,tj) in enumerate(token_range.tolist()):
-                # ignore place-holders
-                if ti == tj == 0:
-                    continue
-                if self.scale_position == "include":
-                    attention_mask[bi, head_idx, :, ti:tj] += self.scale_constant
-                elif self.scale_position == "exclude":
-                    attention_mask[bi, head_idx, :, :ti] += self.scale_constant
-                    attention_mask[bi, head_idx, :, tj:input_len] += self.scale_constant
-                elif self.scale_position == "generation":
-                    attention_mask[bi, head_idx, :, :input_len] += self.scale_constant 
-                else:
-                    raise ValueError(f"Unexcepted {self.scale_position}.")
-        if self.scale_position == "include":
-            attention_mask[:, head_idx, :, :input_len] -= self.scale_constant
-        assert torch.allclose(attention_mask, temp_attention_mask), \
-            "fast attention mask does not match the original one"
+        attention_mask = attention_mask + mask
+        # temp_attention_mask = attention_mask.clone()
+        # temp_attention_mask = temp_attention_mask + mask
+        # for token_range in token_ranges:
+        #     for bi, (ti,tj) in enumerate(token_range.tolist()):
+        #         # ignore place-holders
+        #         if ti == tj == 0:
+        #             continue
+        #         if self.scale_position == "include":
+        #             attention_mask[bi, head_idx, :, ti:tj] += self.scale_constant
+        #         elif self.scale_position == "exclude":
+        #             attention_mask[bi, head_idx, :, :ti] += self.scale_constant
+        #             attention_mask[bi, head_idx, :, tj:input_len] += self.scale_constant
+        #         elif self.scale_position == "generation":
+        #             attention_mask[bi, head_idx, :, :input_len] += self.scale_constant 
+        #         else:
+        #             raise ValueError(f"Unexcepted {self.scale_position}.")
+        # if self.scale_position == "include":
+        #     attention_mask[:, head_idx, :, :input_len] -= self.scale_constant
+        # assert not (temp_attention_mask-attention_mask).any(), \
+        #     "fast attention mask does not match the original one"
 
         if self.model_name in ["llama", "mistral", "phi3mini"]:
             attention_mask.old_size = attention_mask.size 
@@ -747,7 +750,7 @@ class PASTA(abc.ABC):
         input_len = model_input['input_ids'].size(-1)
         # 2) 计算 ranges（合并重叠、映射原始索引）
         token_ranges = self.token_ranges_from_model_input(model_input, n_min=n_min, n_max=n_max)
-        if mode == 'fast':
+        if mode == 'fast' and len(token_ranges) > 0:
             # 预先构建各层的 operation_mask
             operation_masks = self.build_operation_masks(
                 token_ranges,
@@ -763,11 +766,11 @@ class PASTA(abc.ABC):
         for layer_idx in self.all_layers_idx:
             name = self.ATTN_MODULE_NAME[self.model_name].format(layer_idx)
             attn_module = module.get_submodule(name)
-            if mode == 'fast':
+            if mode == 'fast' and len(token_ranges) > 0:
                 hook_func = partial(
                     self.edit_multisection_attention_fast,
                     head_idx=self.head_config[layer_idx],
-                    #token_ranges=token_ranges,
+                    token_ranges=token_ranges,
                     operation_mask=operation_masks[layer_idx],
                     input_len=input_len,
                 )

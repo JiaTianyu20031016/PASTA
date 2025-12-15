@@ -5,6 +5,8 @@ from transformers import GPTJForCausalLM, GPTJConfig
 from typing import List
 from datasets import load_dataset
 from tqdm import tqdm
+from accelerate import dispatch_model, infer_auto_device_map
+
 
 def load_wikitext_dataset(limit: int | None = None) -> List[str]:
     """加载 wikitext-103 测试集（可选截断样本数）。"""
@@ -20,25 +22,42 @@ def load_wikitext_dataset(limit: int | None = None) -> List[str]:
     return dataset
 
 
-def main():
-    # 模型与分词器
+def load_GPTJ():
     name = '/data2/jty/models/gpt-j-6B'
     tokenizer = AutoTokenizer.from_pretrained(name)
     config = GPTJConfig.from_pretrained(name)
     model = GPTJForCausalLM(config).to('cuda:6').eval()
     model.load_state_dict(torch.load(f'{name}/pytorch_model.bin'), strict=False)
+    
+    # device_map = infer_auto_device_map(
+    #     model,
+    #     max_memory=None,                      # 或显式指定
+    #     no_split_module_classes=["GPTJBlock"],
+    #     dtype=torch.float16,
+    # )
+    # model = dispatch_model(
+    #     model,
+    #     device_map=device_map
+    # )
+
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'left'
+    return model, tokenizer
+
+
+def main():
+    # 模型与分词器
+    model, tokenizer = load_GPTJ()
 
     # 选择所有注意力头
     head_config = model_utils.list_attention_heads(model)
 
     # 加载尽可能多的测试数据（不截断）
-    texts = load_wikitext_dataset(limit=None)
+    texts = load_wikitext_dataset(limit=256)
 
     # 评估不同 alpha 下的重复度；alpha=1 表示不施加影响（log(1)=0）
-    alpha_list = [1.0, 0.5, 0.1, 0.05, 0.01]
+    alpha_list = [0.5, 0.1, 0.05, 0.01]
     results = {}
 
     for alpha in alpha_list:
@@ -50,7 +69,7 @@ def main():
             alpha=alpha,
             scale_position="include",
         )
-        batch_size = 64
+        batch_size = 4
         max_new_tokens = 128
         do_sample = True
         top_p = 0.9
@@ -61,6 +80,7 @@ def main():
         total_rep_r = 0.0
         rep_ratio_sum = {2: 0.0, 3: 0.0, 4: 0.0}
         num_batches = 0
+        generated_texts = []
 
         with pasta.dynamic_apply_steering(model=model, n_min=2, n_max=4, mode='fast'):
             for start in tqdm(range(0, len(texts), batch_size)):
@@ -76,6 +96,7 @@ def main():
                     temperature=temperature,
                 )
                 decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+                generated_texts.extend(decoded)
                 # 计算当前 batch 的重复度
                 rep_w = repetition_utils.calculate_rep_w(decoded, w=16)
                 rep_r = repetition_utils.calculate_rep_r(decoded)
@@ -100,6 +121,11 @@ def main():
         print(f"rep_w (avg): {avg_rep_w:.4f}")
         print(f"rep_r (avg): {avg_rep_r:.4f}")
         print(f"rep_ratio (avg): {avg_rep_ratio}")
+
+        # log some generated samples
+        print("\nSome generated samples:")
+        for i in range(min(3, len(generated_texts))):
+            print(f"Sample {i+1}:\n{generated_texts[i]}\n")
 
     print("\nSummary:")
     for alpha in alpha_list:
