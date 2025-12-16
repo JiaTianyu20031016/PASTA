@@ -9,13 +9,16 @@ import matplotlib.pyplot as plt
 from transformers import AutoTokenizer, GPTJForCausalLM, GPTJConfig
 
 
-def load_wikitext_dataset(limit: int | None = None) -> List[str]:
+def load_wikitext_dataset(limit: int | None = None, length: int |None = None) -> List[str]:
     data = load_dataset("wikitext", "wikitext-103-v1")["test"]
     dataset: List[str] = []
     for idx in tqdm(range(len(data)), desc="Load wikitext"):
         text = data[idx]["text"].strip()
         if text and not text.startswith("="):
-            dataset.append(text)
+            if length is not None:
+                dataset.append(text[:length])
+            else:
+                dataset.append(text)
         if limit is not None and len(dataset) >= limit:
             break
     print(f"[!] load {len(dataset)} samples")
@@ -37,12 +40,12 @@ def load_GPTJ(device: str = "cuda"):
 
 
 def main():
-    device = "cuda"
+    device = "cuda:6"
     model, tokenizer = load_GPTJ(device=device)
 
-    texts = load_wikitext_dataset(limit=128)
+    texts = load_wikitext_dataset(limit=128, length=64)
 
-    batch_size = 16
+    batch_size = 12
     max_new_tokens = 64
     do_sample = True
     top_p = 0.9
