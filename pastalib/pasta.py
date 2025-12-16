@@ -605,9 +605,19 @@ class PASTA(abc.ABC):
         model_input: ModelInput,
         n_min: int = 2,
         n_max: int = 4,
+        nearest_k: int = 10,
+        mode: Literal['union', 'intersection', 'repetitive-only', 'nearest-only']='repetitive-only',
     ) -> list[torch.Tensor]:
         """
-        基于输入 batch 的重复 n-gram（忽略 padding）生成 token ranges。
+        基于输入 batch 生成两类 token ranges，并按 `mode` 合成：
+        - 重复 n-gram 的区间（忽略 padding）。
+        - 离生成位置（序列右端的有效 token 末尾）最近的 `nearest_k` 个合法 token（单 token 区间）。
+
+        `mode` 取值：
+        - 'repetitive-only'：仅使用重复 n-gram 区间；
+        - 'nearest-only'：仅使用最近 k token 区间；
+        - 'union'：两者并集；
+        - 'intersection'：两者交集。
 
         返回：List[Tensor]，每个张量形状为 (batch_size, 2)。不足的样本位置用 (0, 0) 占位。
         """
@@ -618,6 +628,7 @@ class PASTA(abc.ABC):
         tokens_batch = []
         # 记录从去 padding 的序列到原始序列的左偏移，以便将范围映射回原始索引
         left_offsets: list[int] = []
+        right_limits: list[int] = []  # 原始索引空间中，右侧开区间的下标（即生成位置）
         for i in range(input_ids.size(0)):
             ids = input_ids[i]
             left_offset = 0
@@ -626,6 +637,11 @@ class PASTA(abc.ABC):
                 # 仅考虑有效 token（通常为中间连续区间）；计算左端第一个有效位置作为偏移
                 if mask.any():
                     left_offset = int(torch.argmax(mask.int()))
+                    valid_len = int(mask.sum().item())
+                    right_limit = left_offset + valid_len
+                else:
+                    valid_len = 0
+                    right_limit = 0
                 ids = ids[mask]
             elif pad_id is not None:
                 # 不假定 pad 在左或右，两侧同时剔除 pad_id，并记录左侧剔除数量作为偏移
@@ -638,16 +654,22 @@ class PASTA(abc.ABC):
                     right -= 1
                 left_offset = left
                 ids = ids[left:right]
+                right_limit = right  # 原始索引空间的右开端
             tokens = self.tokenizer.convert_ids_to_tokens(ids.tolist())
             tokens_batch.append(tokens)
             left_offsets.append(left_offset)
+            # 当没有 attention_mask 且没有 pad_id 时，视整段为有效
+            if attention_mask is None and pad_id is None:
+                right_limit = int(input_ids.size(1))
+            right_limits.append(right_limit)
 
         # 统计重复 n-gram
         _, stats_batch = repetition_utils.batch_find_repetitive_ngram(
             tokens_batch, n_min=n_min, n_max=n_max
         )
 
-        per_sample_ranges: list[list[tuple[int, int]]] = []
+        # 1) 重复 n-gram 区间（映射回原始索引）
+        per_sample_rep_ranges: list[list[tuple[int, int]]] = []
         for sample_idx, stats in enumerate(stats_batch):
             ranges: list[tuple[int, int]] = []
             for n in range(n_min, n_max + 1):
@@ -668,16 +690,72 @@ class PASTA(abc.ABC):
                     merged.append(seg)
                 else:
                     merged[-1] = (merged[-1][0], max(merged[-1][1], seg[1]))
-            per_sample_ranges.append(merged)
+            per_sample_rep_ranges.append(merged)
 
-        max_len = max((len(r) for r in per_sample_ranges), default=0)
+        # 2) 最近 k 个合法 token 的单点区间（原始索引）
+        per_sample_near_ranges: list[list[tuple[int, int]]] = []
+        for b in range(input_ids.size(0)):
+            left = left_offsets[b]
+            right = right_limits[b]
+            if right <= left:
+                per_sample_near_ranges.append([])
+                continue
+            start = max(right - nearest_k, left)
+            near: list[tuple[int, int]] = [(pos, pos + 1) for pos in range(start, right)]
+            per_sample_near_ranges.append(near)
+
+        # 3) 基于 mode 合成区间
+        def merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+            if not intervals:
+                return []
+            intervals.sort(key=lambda x: (x[0], x[1]))
+            merged: list[tuple[int, int]] = []
+            for seg in intervals:
+                if not merged or seg[0] > merged[-1][1]:
+                    merged.append(seg)
+                else:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], seg[1]))
+            return merged
+
+        def intersect_intervals(a: list[tuple[int, int]], b: list[tuple[int, int]]) -> list[tuple[int, int]]:
+            i, j = 0, 0
+            out: list[tuple[int, int]] = []
+            while i < len(a) and j < len(b):
+                l = max(a[i][0], b[j][0])
+                r = min(a[i][1], b[j][1])
+                if l < r:
+                    out.append((l, r))
+                if a[i][1] < b[j][1]:
+                    i += 1
+                else:
+                    j += 1
+            return merge_intervals(out)
+
+        per_sample_final: list[list[tuple[int, int]]] = []
+        for b in range(input_ids.size(0)):
+            rep_ranges = per_sample_rep_ranges[b]
+            near_ranges = per_sample_near_ranges[b]
+            if mode == 'repetitive-only':
+                final_ranges = rep_ranges
+            elif mode == 'nearest-only':
+                final_ranges = merge_intervals(near_ranges)
+            elif mode == 'union':
+                final_ranges = merge_intervals(rep_ranges + near_ranges)
+            elif mode == 'intersection':
+                # 需要保证两边已合并、排序
+                final_ranges = intersect_intervals(merge_intervals(rep_ranges), merge_intervals(near_ranges))
+            else:
+                raise ValueError(f"Unsupported mode: {mode}")
+            per_sample_final.append(final_ranges)
+
+        max_len = max((len(r) for r in per_sample_final), default=0)
         if max_len == 0:
             return []
 
         batch_tensors: list[torch.Tensor] = []
         for idx in range(max_len):
             seg: list[tuple[int, int]] = []
-            for rlist in per_sample_ranges:
+            for rlist in per_sample_final:
                 if idx < len(rlist):
                     seg.append(rlist[idx])
                 else:
@@ -692,9 +770,10 @@ class PASTA(abc.ABC):
         module: torch.nn.Module, 
         input_args: tuple,
         input_kwargs: dict, 
-        n_min: int,
-        n_max: int,
-        mode: Literal['default', 'fast']='default',
+        n_min: int=2,
+        n_max: int=4,
+        nearest_k: int = 10,
+        mode: Literal['union', 'intersection', 'repetitive-only', 'nearest-only']='repetitive-only',
     ):
         """
         注册在整个模型上的 pre-forward hook：
@@ -749,8 +828,14 @@ class PASTA(abc.ABC):
 
         input_len = model_input['input_ids'].size(-1)
         # 2) 计算 ranges（合并重叠、映射原始索引）
-        token_ranges = self.token_ranges_from_model_input(model_input, n_min=n_min, n_max=n_max)
-        if mode == 'fast' and len(token_ranges) > 0:
+        token_ranges = self.token_ranges_from_model_input(
+            model_input, 
+            n_min=n_min, 
+            n_max=n_max,
+            nearest_k=nearest_k,
+            mode=mode
+        )
+        if len(token_ranges) > 0:
             # 预先构建各层的 operation_mask
             operation_masks = self.build_operation_masks(
                 token_ranges,
@@ -766,7 +851,7 @@ class PASTA(abc.ABC):
         for layer_idx in self.all_layers_idx:
             name = self.ATTN_MODULE_NAME[self.model_name].format(layer_idx)
             attn_module = module.get_submodule(name)
-            if mode == 'fast' and len(token_ranges) > 0:
+            if len(token_ranges) > 0:
                 hook_func = partial(
                     self.edit_multisection_attention_fast,
                     head_idx=self.head_config[layer_idx],
@@ -810,7 +895,8 @@ class PASTA(abc.ABC):
         model: Model,
         n_min: int = 2,
         n_max: int = 4,
-        mode: Literal['default', 'fast']='default',
+        nearest_k: int = 10,
+        mode: Literal['union', 'intersection', 'repetitive-only', 'nearest-only']='repetitive-only',
     ):
         """
         模型级动态注意力引导的上下文管理器。
@@ -826,7 +912,13 @@ class PASTA(abc.ABC):
         """
         # 注册模型级 pre-forward hook
         model_level_hook = model.register_forward_pre_hook(
-            partial(self.dynamic_edit_multisection_attention, n_min=n_min, n_max=n_max, mode=mode),
+            partial(
+                self.dynamic_edit_multisection_attention,
+                n_min=n_min,
+                n_max=n_max,
+                nearest_k=nearest_k,
+                mode=mode,
+            ),
             with_kwargs=True,
         )
         try:

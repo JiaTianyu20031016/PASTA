@@ -6,7 +6,8 @@ from typing import List
 from datasets import load_dataset
 from tqdm import tqdm
 from accelerate import dispatch_model, infer_auto_device_map
-
+import json
+import math
 
 def load_wikitext_dataset(limit: int | None = None) -> List[str]:
     """加载 wikitext-103 测试集（可选截断样本数）。"""
@@ -26,7 +27,7 @@ def load_GPTJ():
     name = '/data2/jty/models/gpt-j-6B'
     tokenizer = AutoTokenizer.from_pretrained(name)
     config = GPTJConfig.from_pretrained(name)
-    model = GPTJForCausalLM(config).to('cuda:6').eval()
+    model = GPTJForCausalLM(config).to('cuda').eval()
     model.load_state_dict(torch.load(f'{name}/pytorch_model.bin'), strict=False)
     
     # device_map = infer_auto_device_map(
@@ -46,18 +47,48 @@ def load_GPTJ():
     return model, tokenizer
 
 
+def compute_perplexity(model, tokenizer, texts, batch_size, pasta: PASTA):
+    """Compute perplexity on the given texts with steering enabled."""
+    total_loss = 0.0
+    total_tokens = 0
+    with torch.no_grad():
+        for start in tqdm(range(0, len(texts), batch_size), desc="PPL"):
+            batch_texts = texts[start:start + batch_size]
+            if not batch_texts:
+                break
+            inputs, _ = pasta.inputs_from_batch(batch_texts, device=model.device)
+            input_ids = inputs["input_ids"]
+            labels = input_ids.clone()
+            attention_mask = inputs.get("attention_mask")
+            if attention_mask is not None:
+                labels = labels.masked_fill(attention_mask == 0, -100)
+                token_count = int(attention_mask.sum().item())
+            else:
+                token_count = labels.numel()
+
+            outputs = model(**inputs, labels=labels)
+            loss = outputs.loss
+            total_loss += loss.item() * token_count
+            total_tokens += token_count
+
+    if total_tokens == 0:
+        return float("nan")
+    return math.exp(total_loss / total_tokens)
+
+
 def main():
     # 模型与分词器
     model, tokenizer = load_GPTJ()
 
     # 选择所有注意力头
     head_config = model_utils.list_attention_heads(model)
+    # head_config = json.load(open('/data2/jty/PASTA/config/head_config/gptj/multi_task/intersection/top250_json-bio-cf-pron_train1000.json', 'r'))
 
     # 加载尽可能多的测试数据（不截断）
-    texts = load_wikitext_dataset(limit=256)
+    texts = load_wikitext_dataset(limit=1024)
 
     # 评估不同 alpha 下的重复度；alpha=1 表示不施加影响（log(1)=0）
-    alpha_list = [0.5, 0.1, 0.05, 0.01]
+    alpha_list = [10.0, 5.0, 2.0, 1.0, 0.5, 0.1, 0.05, 0.01]
     results = {}
 
     for alpha in alpha_list:
@@ -69,7 +100,7 @@ def main():
             alpha=alpha,
             scale_position="include",
         )
-        batch_size = 4
+        batch_size = 64
         max_new_tokens = 128
         do_sample = True
         top_p = 0.9
@@ -82,7 +113,14 @@ def main():
         num_batches = 0
         generated_texts = []
 
-        with pasta.dynamic_apply_steering(model=model, n_min=2, n_max=4, mode='fast'):
+        with pasta.dynamic_apply_steering(model=model, 
+                                          n_min=5, 
+                                          n_max=5, 
+                                          nearest_k=30,
+                                          mode='repetitive-only') as steered_model:
+            # perplexity（与重复度评估使用同一数据）
+            ppl = compute_perplexity(model, tokenizer, texts, 32, pasta)
+            
             for start in tqdm(range(0, len(texts), batch_size)):
                 batch_texts = texts[start:start + batch_size]
                 if not batch_texts:
@@ -116,11 +154,13 @@ def main():
             "rep_w": avg_rep_w,
             "rep_r": avg_rep_r,
             "rep_ratio": avg_rep_ratio,
+            "ppl": ppl,
         }
         print(f"\n=== Alpha={alpha} ===")
         print(f"rep_w (avg): {avg_rep_w:.4f}")
         print(f"rep_r (avg): {avg_rep_r:.4f}")
         print(f"rep_ratio (avg): {avg_rep_ratio}")
+        print(f"ppl: {ppl:.4f}")
 
         # log some generated samples
         print("\nSome generated samples:")
@@ -130,7 +170,10 @@ def main():
     print("\nSummary:")
     for alpha in alpha_list:
         r = results[alpha]
-        print(f"Alpha={alpha} -> rep_w={r['rep_w']:.4f}, rep_r={r['rep_r']:.4f}, rep_ratio={r['rep_ratio']}")
+        print(
+            f"Alpha={alpha} -> rep_w={r['rep_w']:.4f}, rep_r={r['rep_r']:.4f}, "
+            f"rep_ratio={r['rep_ratio']}, ppl={r['ppl']:.4f}"
+        )
 
 
 if __name__ == "__main__":
